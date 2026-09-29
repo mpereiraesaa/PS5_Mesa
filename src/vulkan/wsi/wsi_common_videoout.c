@@ -216,12 +216,19 @@ struct wsi_videoout_output {
     * i * VIDEOOUT_BUFFERS onwards. */
    struct {
       VkExtent2D extent;
+      uint64_t pixel_format;
       uint64_t buffer_bytes;
       uint8_t *memory;
    } set[VIDEOOUT_SETS];
    uint32_t set_count;
    /* The argument of the latest flip submitted; each flip's is one more. */
    int64_t flip_argument;
+   /* When a swapchain last flipped; CPU frames show only once it is idle. */
+   uint64_t swapchain_flip_ns;
+   /* The set CPU frames are copied into (wsi_videoout_show_tiled), and the
+    * buffer of it written last; -1 before the first. */
+   int32_t cpu_set;
+   uint32_t cpu_buffer;
    struct {
       /* The argument this buffer was last flipped with, 0 before its first flip. */
       int64_t argument;
@@ -242,6 +249,7 @@ struct wsi_videoout_output {
 
 static struct wsi_videoout_output videoout_output = {
    .handle = -1,
+   .cpu_set = -1,
 };
 static once_flag videoout_once = ONCE_FLAG_INIT;
 
@@ -376,11 +384,12 @@ videoout_buffer_bytes(VkExtent2D extent)
  * time a swapchain takes that size; a set stays registered for the process,
  * as a buffer of it may be on screen. Under lock. */
 static VkResult
-videoout_register_locked(VkExtent2D extent, uint32_t *set_out)
+videoout_register_format_locked(VkExtent2D extent, uint64_t pixel_format, uint32_t *set_out)
 {
    struct wsi_videoout_output *out = &videoout_output;
    for (uint32_t i = 0; i < out->set_count; i++) {
-      if (out->set[i].extent.width == extent.width && out->set[i].extent.height == extent.height) {
+      if (out->set[i].extent.width == extent.width && out->set[i].extent.height == extent.height &&
+          out->set[i].pixel_format == pixel_format) {
          *set_out = i;
          return VK_SUCCESS;
       }
@@ -427,8 +436,8 @@ videoout_register_locked(VkExtent2D extent, uint32_t *set_out)
    for (uint32_t i = 0; i < VIDEOOUT_BUFFERS; i++)
       registered[i] = (struct ps5_video_out_buffer){.data = buffers + i * buffer_bytes};
    uint8_t attribute[PS5_VIDEO_OUT_ATTRIBUTE_BYTES] = {0};
-   sceVideoOutSetBufferAttribute2(attribute, PS5_VIDEO_OUT_PIXEL_FORMAT_B8G8R8A8_SDR,
-                                  PS5_VIDEO_OUT_TILING_64KB_R_X, extent.width, extent.height, 0, 0, 0);
+   sceVideoOutSetBufferAttribute2(attribute, pixel_format, PS5_VIDEO_OUT_TILING_64KB_R_X, extent.width,
+                                  extent.height, 0, 0, 0);
    if (result == 0)
       result = sceVideoOutRegisterBuffers2(out->handle, (int32_t)set, (int32_t)(set * VIDEOOUT_BUFFERS), registered,
                                            VIDEOOUT_BUFFERS, attribute, 0, NULL);
@@ -439,11 +448,18 @@ videoout_register_locked(VkExtent2D extent, uint32_t *set_out)
       return VK_ERROR_INITIALIZATION_FAILED;
    }
    out->set[set].extent = extent;
+   out->set[set].pixel_format = pixel_format;
    out->set[set].buffer_bytes = buffer_bytes;
    out->set[set].memory = buffers;
    out->set_count++;
    *set_out = set;
    return VK_SUCCESS;
+}
+
+static VkResult
+videoout_register_locked(VkExtent2D extent, uint32_t *set_out)
+{
+   return videoout_register_format_locked(extent, PS5_VIDEO_OUT_PIXEL_FORMAT_B8G8R8A8_SDR, set_out);
 }
 
 static int64_t
@@ -478,6 +494,7 @@ videoout_flip_thread(void *data)
       if (result == 0) {
          out->flip_argument = argument;
          out->buffer[present.buffer].argument = argument;
+         out->swapchain_flip_ns = os_time_get_nano();
       } else {
          fprintf(stderr, "wsi/videoout: sceVideoOutSubmitFlip(%u) failed: 0x%08x\n", present.buffer,
                  (unsigned)result);
@@ -489,6 +506,81 @@ videoout_flip_thread(void *data)
       cnd_broadcast(&out->changed);
    }
    return 0;
+}
+
+/* --- CPU frames ------------------------------------------------------------ */
+
+/* Whether a CPU frame would show now: the display is open and no swapchain
+ * has a flip queued or has flipped within VIDEOOUT_CPU_IDLE_NS. */
+#define VIDEOOUT_CPU_IDLE_NS UINT64_C(150000000)
+
+static bool
+videoout_cpu_idle_locked(void)
+{
+   const struct wsi_videoout_output *out = &videoout_output;
+   return out->opened && out->handle >= 0 && out->queue_count == 0 &&
+          os_time_get_nano() - out->swapchain_flip_ns >= VIDEOOUT_CPU_IDLE_NS;
+}
+
+bool
+wsi_videoout_idle(void)
+{
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&videoout_output.lock);
+   const bool idle = videoout_cpu_idle_locked();
+   mtx_unlock(&videoout_output.lock);
+   return idle;
+}
+
+/* Shows a frame the CPU drew, already in VideoOut's 64 KiB tiling (as a
+ * title's own presenter writes it), while no swapchain is presenting: a
+ * game's GDI content, such as a DirectShow movie drawn outside Direct3D, in
+ * between its Vulkan frames. The next swapchain present takes the screen
+ * back. Returns 0 when flipped, 1 when a swapchain is presenting, <0 on
+ * failure. */
+int
+wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint32_t height, uint64_t pixel_format)
+{
+   struct wsi_videoout_output *out = &videoout_output;
+   if (!tiled || !width || !height)
+      return -1;
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&out->lock);
+   if (!videoout_cpu_idle_locked()) {
+      mtx_unlock(&out->lock);
+      return 1;
+   }
+   uint32_t set;
+   if (out->cpu_set >= 0 && out->set[out->cpu_set].extent.width == width &&
+       out->set[out->cpu_set].extent.height == height && out->set[out->cpu_set].pixel_format == pixel_format) {
+      set = (uint32_t)out->cpu_set;
+   } else if (videoout_register_format_locked((VkExtent2D){width, height}, pixel_format, &set) == VK_SUCCESS) {
+      out->cpu_set = (int32_t)set;
+   } else {
+      mtx_unlock(&out->lock);
+      return -2;
+   }
+   /* Round robin over the set: the buffer written was last on screen
+    * VIDEOOUT_BUFFERS - 1 flips ago. */
+   out->cpu_buffer = (out->cpu_buffer + 1) % VIDEOOUT_BUFFERS;
+   const uint32_t buffer = set * VIDEOOUT_BUFFERS + out->cpu_buffer;
+   uint8_t *target = out->set[set].memory + (uint64_t)out->cpu_buffer * out->set[set].buffer_bytes;
+   const uint64_t copied = MIN2(bytes, out->set[set].buffer_bytes);
+   memcpy(target, tiled, copied);
+#if defined(__PROSPERO__)
+   /* The display reads memory, not the CPU's cache. */
+   for (uint64_t at = 0; at < copied; at += 64)
+      _mm_clflush(target + at);
+   _mm_mfence();
+#endif
+   const int64_t argument = out->flip_argument + 1;
+   const int result = sceVideoOutSubmitFlip(out->handle, (int32_t)buffer, PS5_VIDEO_OUT_FLIP_VSYNC, argument);
+   if (result == 0) {
+      out->flip_argument = argument;
+      out->buffer[buffer].argument = argument;
+   }
+   mtx_unlock(&out->lock);
+   return result == 0 ? 0 : -3;
 }
 
 /* --- VK_KHR_display -------------------------------------------------------- */

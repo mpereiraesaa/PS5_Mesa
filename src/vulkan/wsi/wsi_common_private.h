@@ -601,6 +601,12 @@ wsi_common_get_time_domain(VkSwapchainKHR _swapchain,
 }
 
 #ifdef MESA_WSI_VIDEOOUT
+/* The PlayStation 5's display (wsi_common_videoout.c): CPU frames shown
+ * while no swapchain presents, for a title's own presenter. */
+bool wsi_videoout_idle(void);
+int wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint32_t height,
+                            uint64_t pixel_format);
+
 /* The PlayStation 5's display (wsi_common_videoout.c): images in its
  * framebuffers, laid out as it scans out. */
 struct wsi_videoout_image_params {
