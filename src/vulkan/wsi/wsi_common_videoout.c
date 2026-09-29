@@ -216,7 +216,8 @@ struct wsi_videoout_output {
     * i * VIDEOOUT_BUFFERS onwards. */
    struct {
       VkExtent2D extent;
-      uint64_t pixel_format;
+      /* CPU frames' own set, never a swapchain's (wsi_videoout_show_tiled). */
+      bool cpu;
       uint64_t buffer_bytes;
       uint8_t *memory;
    } set[VIDEOOUT_SETS];
@@ -384,12 +385,12 @@ videoout_buffer_bytes(VkExtent2D extent)
  * time a swapchain takes that size; a set stays registered for the process,
  * as a buffer of it may be on screen. Under lock. */
 static VkResult
-videoout_register_format_locked(VkExtent2D extent, uint64_t pixel_format, uint32_t *set_out)
+videoout_register_kind_locked(VkExtent2D extent, bool cpu, uint32_t *set_out)
 {
    struct wsi_videoout_output *out = &videoout_output;
    for (uint32_t i = 0; i < out->set_count; i++) {
       if (out->set[i].extent.width == extent.width && out->set[i].extent.height == extent.height &&
-          out->set[i].pixel_format == pixel_format) {
+          out->set[i].cpu == cpu) {
          *set_out = i;
          return VK_SUCCESS;
       }
@@ -436,8 +437,8 @@ videoout_register_format_locked(VkExtent2D extent, uint64_t pixel_format, uint32
    for (uint32_t i = 0; i < VIDEOOUT_BUFFERS; i++)
       registered[i] = (struct ps5_video_out_buffer){.data = buffers + i * buffer_bytes};
    uint8_t attribute[PS5_VIDEO_OUT_ATTRIBUTE_BYTES] = {0};
-   sceVideoOutSetBufferAttribute2(attribute, pixel_format, PS5_VIDEO_OUT_TILING_64KB_R_X, extent.width,
-                                  extent.height, 0, 0, 0);
+   sceVideoOutSetBufferAttribute2(attribute, PS5_VIDEO_OUT_PIXEL_FORMAT_B8G8R8A8_SDR,
+                                  PS5_VIDEO_OUT_TILING_64KB_R_X, extent.width, extent.height, 0, 0, 0);
    if (result == 0)
       result = sceVideoOutRegisterBuffers2(out->handle, (int32_t)set, (int32_t)(set * VIDEOOUT_BUFFERS), registered,
                                            VIDEOOUT_BUFFERS, attribute, 0, NULL);
@@ -448,7 +449,7 @@ videoout_register_format_locked(VkExtent2D extent, uint64_t pixel_format, uint32
       return VK_ERROR_INITIALIZATION_FAILED;
    }
    out->set[set].extent = extent;
-   out->set[set].pixel_format = pixel_format;
+   out->set[set].cpu = cpu;
    out->set[set].buffer_bytes = buffer_bytes;
    out->set[set].memory = buffers;
    out->set_count++;
@@ -459,7 +460,7 @@ videoout_register_format_locked(VkExtent2D extent, uint64_t pixel_format, uint32
 static VkResult
 videoout_register_locked(VkExtent2D extent, uint32_t *set_out)
 {
-   return videoout_register_format_locked(extent, PS5_VIDEO_OUT_PIXEL_FORMAT_B8G8R8A8_SDR, set_out);
+   return videoout_register_kind_locked(extent, false, set_out);
 }
 
 static int64_t
@@ -533,13 +534,16 @@ wsi_videoout_idle(void)
 }
 
 /* Shows a frame the CPU drew, already in VideoOut's 64 KiB tiling (as a
- * title's own presenter writes it), while no swapchain is presenting: a
+ * title's own presenter writes it) and in B8G8R8A8 as the swapchains are:
+ * VideoOut scales a smaller set of that format to the mode, not one of the
+ * title's R8G8B8A8 format, which it shows unscaled at the top left
+ * (measured). While no swapchain is presenting: a
  * game's GDI content, such as a DirectShow movie drawn outside Direct3D, in
  * between its Vulkan frames. The next swapchain present takes the screen
  * back. Returns 0 when flipped, 1 when a swapchain is presenting, <0 on
  * failure. */
 int
-wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint32_t height, uint64_t pixel_format)
+wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint32_t height)
 {
    struct wsi_videoout_output *out = &videoout_output;
    if (!tiled || !width || !height)
@@ -552,9 +556,9 @@ wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint3
    }
    uint32_t set;
    if (out->cpu_set >= 0 && out->set[out->cpu_set].extent.width == width &&
-       out->set[out->cpu_set].extent.height == height && out->set[out->cpu_set].pixel_format == pixel_format) {
+       out->set[out->cpu_set].extent.height == height) {
       set = (uint32_t)out->cpu_set;
-   } else if (videoout_register_format_locked((VkExtent2D){width, height}, pixel_format, &set) == VK_SUCCESS) {
+   } else if (videoout_register_kind_locked((VkExtent2D){width, height}, true, &set) == VK_SUCCESS) {
       out->cpu_set = (int32_t)set;
    } else {
       mtx_unlock(&out->lock);
