@@ -14,9 +14,11 @@
  * both). VideoOut's framebuffers are the process's: sets of five buffers of
  * direct memory, one set per swapchain size, each registered once, in the
  * 64 KiB R_X tiles VideoOut scans out (ps5platform/videoout.h). VideoOut
- * scales a set smaller than the mode to the whole output, so a swapchain may
- * be any size up to the mode's (a 1920x1080 buffer fills a 3840x2160 output,
- * as ps5vk's 1080p buffers do). A swapchain takes the first buffers of its
+ * scaled a 1920x1080 set to the whole 3840x2160 output (Remote Play capture
+ * of DXVK's D3D11 and D3D9 through Wine; ps5vk's 1080p buffers likewise), so
+ * swapchains up to the mode's size are accepted; other sizes, and a second
+ * set in one process, are not measured yet, and a set VideoOut refuses fails
+ * the swapchain's creation. A swapchain takes the first buffers of its
  * size's set as its images, imported into its device as host memory
  * (VK_EXT_external_memory_host) and laid out as the display takes them (the
  * device's display swizzle, radeon_info), so a device made again, as
