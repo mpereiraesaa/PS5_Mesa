@@ -605,11 +605,16 @@ wsi_common_get_time_domain(VkSwapchainKHR _swapchain,
  * while no swapchain presents, for a title's own presenter. */
 bool wsi_videoout_idle(void);
 int wsi_videoout_show_tiled(const void *tiled, uint64_t bytes, uint32_t width, uint32_t height);
+/* Where the presenting swapchain's images show in its framebuffers. */
+bool wsi_videoout_present_rect(VkRect2D *rect, VkExtent2D *frame);
 
 /* The PlayStation 5's display (wsi_common_videoout.c): images in its
  * framebuffers, laid out as it scans out. */
 struct wsi_videoout_image_params {
    struct wsi_base_image_params base;
+   /* The images are the application's own, blitted at present into
+    * framebuffers of a size VideoOut takes, instead of being framebuffers. */
+   bool scaled;
 };
 
 VkResult

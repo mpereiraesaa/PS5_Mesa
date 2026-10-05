@@ -206,6 +206,8 @@ struct wsi_device {
    WSI_CB(BindImageMemory);
    WSI_CB(BeginCommandBuffer);
    WSI_CB(CmdPipelineBarrier);
+   WSI_CB(CmdBlitImage);
+   WSI_CB(CmdClearColorImage);
    WSI_CB(CmdCopyImage);
    WSI_CB(CmdCopyImageToBuffer);
    WSI_CB(CmdResetQueryPool);
