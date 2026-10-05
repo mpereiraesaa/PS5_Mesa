@@ -15,15 +15,19 @@
  * direct memory, one set per swapchain size, each registered once, in the
  * 64 KiB R_X tiles VideoOut scans out (ps5platform/videoout.h). VideoOut
  * scaled a 1920x1080 set to the whole 3840x2160 output (Remote Play capture
- * of DXVK's D3D11 and D3D9 through Wine; ps5vk's 1080p buffers likewise), so
- * swapchains up to the mode's size are accepted; other sizes, and a second
- * set in one process, are not measured yet, and a set VideoOut refuses fails
- * the swapchain's creation. A swapchain takes the first buffers of its
- * size's set as its images, imported into its device as host memory
- * (VK_EXT_external_memory_host) and laid out as the display takes them (the
+ * of DXVK's D3D11 and D3D9 through Wine; ps5vk's 1080p buffers likewise), but
+ * it takes framebuffers of a few sizes only (wsi_common_videoout_scale.h):
+ * 1440x1080, 1440x960 and 1280x720 sets were refused with 0x80290005, and a
+ * fourth set in one process with 0x80290001 (mihawk-99/PS5_Vulkan
+ * HARDWARE_FINDINGS.md, 2026-10-04). A swapchain of a size it takes takes the
+ * first buffers of its size's set as its images, imported into its device as
+ * host memory (VK_EXT_external_memory_host) and laid out as the display takes them (the
  * device's display swizzle, radeon_info), so a device made again, as
  * RetroArch makes one for each core, presents where the last one did and the
- * screen keeps its last frame in between.
+ * screen keeps its last frame in between. A swapchain of any other size up to
+ * the mode's renders into images of its own, and each present blits its image
+ * on the presenting queue into a buffer of the smallest taken size that holds
+ * it, scaled to fit with its aspect ratio kept and centred, the bars black.
  *
  * A present waits for the frame on a thread and flips it with
  * sceVideoOutSubmitFlip at the next vblank; FIFO is the only present mode. An
@@ -48,6 +52,7 @@
 #include "vk_util.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
+#include "wsi_common_videoout_scale.h"
 
 #if defined(__PROSPERO__)
 #include <immintrin.h>
@@ -60,8 +65,12 @@
 #define VIDEOOUT_WIDTH 3840
 #define VIDEOOUT_HEIGHT 2160
 #define VIDEOOUT_BUFFERS 5
-/* Swapchain sizes one process may present at; each takes a set of buffers. */
-#define VIDEOOUT_SETS 4
+/* Framebuffer sets one process may register: VideoOut refused a fourth
+ * (0x80290001, buffers 15-19; mihawk-99/PS5_Vulkan HARDWARE_FINDINGS.md,
+ * 2026-10-04). CPU frames take one, swapchains at the taken sizes the others. */
+#define VIDEOOUT_SETS 3
+/* Sizes VideoOut refused, not asked for again in the process. */
+#define VIDEOOUT_REFUSED 8
 /* A 64 KiB tile holds 128x128 four-byte pixels: a 3840x2160 image is 30x17
  * tiles, 31.9 MiB, a 1920x1080 one 15x9 tiles, 8.4 MiB. */
 #define VIDEOOUT_TILE_PIXELS 128
@@ -109,22 +118,36 @@ sceVideoOutSetFlipRate(int32_t handle, int32_t rate)
    return 0;
 }
 
+static uint32_t host_attribute_width, host_attribute_height;
+
 static void
 sceVideoOutSetBufferAttribute2(void *attribute, uint64_t pixel_format, uint32_t tiling, uint32_t width,
                                uint32_t height, uint64_t reserved1, uint32_t reserved2, uint64_t reserved3)
 {
+   host_attribute_width = width;
+   host_attribute_height = height;
 }
 
+/* As measured on the console: framebuffers of the sizes VideoOut takes
+ * register, others are refused as a resolution error. MESA_VK_VIDEOOUT_HOST_LOG
+ * set prints each registration, for a host test to follow. */
 static int
 sceVideoOutRegisterBuffers2(int32_t handle, int32_t set, int32_t start, struct ps5_video_out_buffer *buffers,
                             int32_t count, void *attribute, int32_t reserved, void *option)
 {
-   return 0;
+   const VkExtent2D extent = {host_attribute_width, host_attribute_height};
+   const int result = wsi_videoout_size_taken(extent) ? 0 : (int)0x80290005u;
+   if (getenv("MESA_VK_VIDEOOUT_HOST_LOG"))
+      fprintf(stderr, "videoout-host: register set %d buffers %d-%d %ux%u: 0x%08x\n", set, start, start + count - 1,
+              extent.width, extent.height, (unsigned)result);
+   return result;
 }
 
 static int
 sceVideoOutSubmitFlip(int32_t handle, int32_t buffer_index, uint32_t mode, int64_t argument)
 {
+   if (getenv("MESA_VK_VIDEOOUT_HOST_LOG"))
+      fprintf(stderr, "videoout-host: flip buffer %d argument %" PRId64 "\n", buffer_index, argument);
    host_shown_argument = argument;
    return 0;
 }
@@ -222,6 +245,9 @@ struct wsi_videoout_output {
       uint8_t *memory;
    } set[VIDEOOUT_SETS];
    uint32_t set_count;
+   /* Sizes VideoOut refused: asked again, each would only be refused again. */
+   VkExtent2D refused[VIDEOOUT_REFUSED];
+   uint32_t refused_count;
    /* The argument of the latest flip submitted; each flip's is one more. */
    int64_t flip_argument;
    /* When a swapchain last flipped; CPU frames show only once it is idle. */
@@ -263,9 +289,15 @@ videoout_output_init_once(void)
 
 struct wsi_videoout_swapchain {
    struct wsi_swapchain base;
-   /* Its set: its images are buffers first to first + image_count - 1. */
+   /* Its set: its images are, or are blitted into, buffers first to
+    * first + image_count - 1. */
    uint32_t set;
    uint32_t first;
+   /* Its images are its own, each present blitted into rect of its buffer,
+    * whose size is target (wsi_common_videoout_scale.h). */
+   bool scaled;
+   VkExtent2D target;
+   VkRect2D rect;
    bool retired;
    /* Presents queued and not yet flipped. */
    uint32_t in_flight;
@@ -395,6 +427,9 @@ videoout_register_kind_locked(VkExtent2D extent, bool cpu, uint32_t *set_out)
          return VK_SUCCESS;
       }
    }
+   for (uint32_t i = 0; i < out->refused_count; i++)
+      if (wsi_videoout_extent_equal(out->refused[i], extent))
+         return VK_ERROR_INITIALIZATION_FAILED;
    if (out->set_count == VIDEOOUT_SETS) {
       fprintf(stderr, "wsi/videoout: no set left for a %ux%u swapchain (%u sizes registered)\n", extent.width,
               extent.height, out->set_count);
@@ -445,7 +480,18 @@ videoout_register_kind_locked(VkExtent2D extent, bool cpu, uint32_t *set_out)
    if (result != 0) {
       fprintf(stderr, "wsi/videoout: the %ux%u framebuffers (set %u) were not registered: 0x%08x\n", extent.width,
               extent.height, set, (unsigned)result);
-      /* The memory stays: VideoOut may hold a buffer it was given. */
+      /* Nothing was registered, so nothing can flip these buffers: their
+       * memory goes back. Kept, each refusal leaked a set's worth, and a
+       * game asking again every frame (DXVK does) took all of the process's
+       * direct memory in seconds. The size is not asked for again. */
+#if defined(__PROSPERO__)
+      sceKernelMunmap(buffers, bytes);
+      sceKernelReleaseDirectMemory(physical, bytes);
+#else
+      munmap(buffers, bytes);
+#endif
+      if (out->refused_count < VIDEOOUT_REFUSED)
+         out->refused[out->refused_count++] = extent;
       return VK_ERROR_INITIALIZATION_FAILED;
    }
    out->set[set].extent = extent;
@@ -531,6 +577,24 @@ wsi_videoout_idle(void)
    const bool idle = videoout_cpu_idle_locked();
    mtx_unlock(&videoout_output.lock);
    return idle;
+}
+
+/* Where the presenting swapchain's images show: *frame is the size of the
+ * framebuffers flipped, *rect the part of them an image fills (all of it but
+ * for a scaled swapchain). For the hardware cursor, whose position is in the
+ * flipped framebuffer's pixels. false while no swapchain presents. */
+bool
+wsi_videoout_present_rect(VkRect2D *rect, VkExtent2D *frame)
+{
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&videoout_output.lock);
+   const struct wsi_videoout_swapchain *chain = videoout_output.current;
+   if (chain) {
+      *rect = chain->rect;
+      *frame = chain->target;
+   }
+   mtx_unlock(&videoout_output.lock);
+   return chain != NULL;
 }
 
 /* Shows a frame the CPU drew, already in VideoOut's 64 KiB tiling (as a
@@ -834,9 +898,14 @@ videoout_surface_get_capabilities2(VkIcdSurfaceBase *icd_surface, struct wsi_dev
       }
       case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
          VkSurfacePresentScalingCapabilitiesKHR *scaling = (void *)ext;
-         scaling->supportedPresentScaling = VK_PRESENT_SCALING_STRETCH_BIT_KHR;
-         scaling->supportedPresentGravityX = 0;
-         scaling->supportedPresentGravityY = 0;
+         /* An image of a size VideoOut takes fills the output; any other
+          * is scaled to fit it with its aspect ratio kept, centred: the
+          * window Wine stretches a display mode's image to has the mode's
+          * shape. */
+         scaling->supportedPresentScaling =
+            VK_PRESENT_SCALING_STRETCH_BIT_KHR | VK_PRESENT_SCALING_ASPECT_RATIO_STRETCH_BIT_KHR;
+         scaling->supportedPresentGravityX = VK_PRESENT_GRAVITY_CENTERED_BIT_KHR;
+         scaling->supportedPresentGravityY = VK_PRESENT_GRAVITY_CENTERED_BIT_KHR;
          scaling->minScaledImageExtent = c->minImageExtent;
          scaling->maxScaledImageExtent = c->maxImageExtent;
          break;
@@ -920,19 +989,18 @@ videoout_surface_get_present_rectangles(VkIcdSurfaceBase *surface, struct wsi_de
 
 /* --- Images -------------------------------------------------------------- */
 
-/* A swapchain image: the framebuffer of its index, imported as host memory. */
+/* Framebuffer index of a set, imported into the swapchain's device as host
+ * memory for an image laid out as the display scans out. */
 static VkResult
-videoout_create_image_mem(const struct wsi_swapchain *wsi_chain, const struct wsi_image_info *info,
-                          struct wsi_image *image)
+videoout_import_framebuffer(const struct wsi_swapchain *wsi_chain, VkImage vk_image, uint32_t set, uint32_t index,
+                            VkDeviceMemory *memory)
 {
-   const struct wsi_videoout_swapchain *chain = (const struct wsi_videoout_swapchain *)wsi_chain;
    const struct wsi_device *wsi = wsi_chain->wsi;
-   const uint32_t index = image - chain->images;
-   const uint64_t buffer_bytes = videoout_output.set[chain->set].buffer_bytes;
-   void *const pointer = videoout_output.set[chain->set].memory + index * buffer_bytes;
+   const uint64_t buffer_bytes = videoout_output.set[set].buffer_bytes;
+   void *const pointer = videoout_output.set[set].memory + index * buffer_bytes;
 
    VkMemoryRequirements reqs;
-   wsi->GetImageMemoryRequirements(wsi_chain->device, image->image, &reqs);
+   wsi->GetImageMemoryRequirements(wsi_chain->device, vk_image, &reqs);
    if (reqs.size > buffer_bytes || reqs.alignment > VIDEOOUT_BUFFER_ALIGNMENT) {
       fprintf(stderr, "wsi/videoout: a %" PRIu64 "-byte image does not fit a %" PRIu64 "-byte framebuffer\n",
               (uint64_t)reqs.size, buffer_bytes);
@@ -962,13 +1030,229 @@ videoout_create_image_mem(const struct wsi_swapchain *wsi_chain, const struct ws
       .allocationSize = buffer_bytes,
       .memoryTypeIndex = wsi_select_memory_type(wsi, 0, 0, type_bits),
    };
+   return wsi->AllocateMemory(wsi_chain->device, &allocate, &wsi_chain->alloc, memory);
+}
+
+/* A swapchain image: the framebuffer of its index, imported as host memory. */
+static VkResult
+videoout_create_image_mem(const struct wsi_swapchain *wsi_chain, const struct wsi_image_info *info,
+                          struct wsi_image *image)
+{
+   const struct wsi_videoout_swapchain *chain = (const struct wsi_videoout_swapchain *)wsi_chain;
+   return videoout_import_framebuffer(wsi_chain, image->image, chain->set, image - chain->images, &image->memory);
+}
+
+/* A scaled swapchain's image: the application's own, in device memory. */
+static VkResult
+videoout_create_scaled_image_mem(const struct wsi_swapchain *wsi_chain, const struct wsi_image_info *info,
+                                 struct wsi_image *image)
+{
+   const struct wsi_device *wsi = wsi_chain->wsi;
+   VkMemoryRequirements reqs;
+   wsi->GetImageMemoryRequirements(wsi_chain->device, image->image, &reqs);
+   const VkMemoryDedicatedAllocateInfo dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = image->image,
+   };
+   const VkMemoryAllocateInfo allocate = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated,
+      .allocationSize = reqs.size,
+      .memoryTypeIndex = wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
+   };
    return wsi->AllocateMemory(wsi_chain->device, &allocate, &wsi_chain->alloc, &image->memory);
+}
+
+/* The present's blit of a scaled swapchain's image into its framebuffer: the
+ * bars cleared to black where the image does not cover the framebuffer, the
+ * image scaled into its rectangle, and both back in the layout a present
+ * leaves them in. */
+static void
+videoout_record_scaled_blit(const struct wsi_videoout_swapchain *chain, const struct wsi_image *image,
+                            VkCommandBuffer cmd)
+{
+   const struct wsi_device *wsi = chain->base.wsi;
+   const VkExtent3D source = chain->base.image_info.create.extent;
+   const VkImageSubresourceRange range = {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .levelCount = 1,
+      .layerCount = 1,
+   };
+   VkImageMemoryBarrier barriers[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = 0,
+         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = image->image,
+         .subresourceRange = range,
+      },
+      {
+         /* The framebuffer's last contents are not needed: all of it is
+          * written. */
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = 0,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = image->blit.image,
+         .subresourceRange = range,
+      },
+   };
+   wsi->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+                           NULL, 2, barriers);
+
+   if (!wsi_videoout_rect_covers(chain->rect, chain->target)) {
+      const VkClearColorValue black = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+      wsi->CmdClearColorImage(cmd, image->blit.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+      const VkImageMemoryBarrier cleared = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = image->blit.image,
+         .subresourceRange = range,
+      };
+      wsi->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+                              NULL, 1, &cleared);
+   }
+
+   const VkImageBlit region = {
+      .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+      .srcOffsets = {{0, 0, 0}, {(int32_t)source.width, (int32_t)source.height, 1}},
+      .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+      .dstOffsets = {{chain->rect.offset.x, chain->rect.offset.y, 0},
+                     {chain->rect.offset.x + (int32_t)chain->rect.extent.width,
+                      chain->rect.offset.y + (int32_t)chain->rect.extent.height, 1}},
+   };
+   /* A copy where the image keeps its size, filtered where it is scaled. */
+   const bool same_size = source.width == chain->rect.extent.width && source.height == chain->rect.extent.height;
+   wsi->CmdBlitImage(cmd, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image->blit.image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                     same_size ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+
+   barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+   barriers[0].dstAccessMask = 0;
+   barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+   barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   barriers[1].dstAccessMask = 0;
+   barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+   wsi->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0,
+                           NULL, 2, barriers);
+}
+
+/* After a scaled swapchain's image is made: the framebuffer of its index as
+ * the blit's destination (image->blit.image and .memory, which
+ * wsi_destroy_image frees), and the blit recorded for each queue family that
+ * may present. A blit scales only on a graphics queue; a family without one
+ * presents nothing new (RADV on the PS5 has only the graphics family). */
+static VkResult
+videoout_finish_create_scaled(const struct wsi_swapchain *wsi_chain, const struct wsi_image_info *info,
+                              struct wsi_image *image)
+{
+   const struct wsi_videoout_swapchain *chain = (const struct wsi_videoout_swapchain *)wsi_chain;
+   const struct wsi_device *wsi = wsi_chain->wsi;
+   const uint32_t index = image - chain->images;
+   VkResult result;
+
+   /* A separate blit queue would be a transfer engine, which cannot scale. */
+   if (wsi_chain->blit.queue != NULL)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   const VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+   };
+   const struct wsi_image_create_info scanout = {
+      .sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA,
+      .pNext = &external,
+      .scanout = true,
+   };
+   const VkImageCreateInfo create = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .pNext = &scanout,
+      .flags = VK_IMAGE_CREATE_ALIAS_BIT,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = info->create.format,
+      .extent = {chain->target.width, chain->target.height, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   result = wsi->CreateImage(wsi_chain->device, &create, &wsi_chain->alloc, &image->blit.image);
+   if (result != VK_SUCCESS)
+      return result;
+   result = videoout_import_framebuffer(wsi_chain, image->blit.image, chain->set, index, &image->blit.memory);
+   if (result != VK_SUCCESS)
+      return result;
+   result = wsi->BindImageMemory(wsi_chain->device, image->blit.image, image->blit.memory, 0);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkQueueFamilyProperties families[64];
+   uint32_t family_count = ARRAY_SIZE(families);
+   wsi->GetPhysicalDeviceQueueFamilyProperties(wsi->pdevice, &family_count, families);
+
+   image->blit.cmd_buffers =
+      vk_zalloc(&wsi_chain->alloc, sizeof(VkCommandBuffer) * wsi->queue_family_count, 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!image->blit.cmd_buffers)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   for (uint32_t i = 0; i < wsi->queue_family_count; i++) {
+      if (!wsi_chain->cmd_pools[i])
+         continue;
+      const VkCommandBufferAllocateInfo allocate = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool = wsi_chain->cmd_pools[i],
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = 1,
+      };
+      result = wsi->AllocateCommandBuffers(wsi_chain->device, &allocate, &image->blit.cmd_buffers[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      const VkCommandBufferBeginInfo begin = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      };
+      wsi->BeginCommandBuffer(image->blit.cmd_buffers[i], &begin);
+      if (i < family_count && (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+         videoout_record_scaled_blit(chain, image, image->blit.cmd_buffers[i]);
+      result = wsi->EndCommandBuffer(image->blit.cmd_buffers[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
 }
 
 VkResult
 wsi_videoout_configure_image(const struct wsi_swapchain *chain, const VkSwapchainCreateInfoKHR *pCreateInfo,
                              const struct wsi_videoout_image_params *params, struct wsi_image_info *info)
 {
+   if (params->scaled) {
+      /* The application's own images, read by the present's blit. */
+      VkResult result = wsi_configure_image(chain, pCreateInfo, 0, info);
+      if (result != VK_SUCCESS)
+         return result;
+      info->create.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      info->usage2.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      info->create_mem = videoout_create_scaled_image_mem;
+      info->finish_create = videoout_finish_create_scaled;
+      return VK_SUCCESS;
+   }
+
    VkResult result =
       wsi_configure_image(chain, pCreateInfo, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, info);
    if (result != VK_SUCCESS)
@@ -1171,9 +1455,14 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
    if (mode->high_frame_rate && !out->high_mode_offered)
       return VK_ERROR_INITIALIZATION_FAILED;
 
+   /* A size VideoOut takes is its framebuffers; any other is blitted into
+    * framebuffers of the smallest taken size that holds it. */
+   const VkExtent2D target = wsi_videoout_target_extent(extent);
+   const bool scaled = !wsi_videoout_extent_equal(target, extent);
+
    uint32_t set = 0;
    mtx_lock(&out->lock);
-   VkResult result = videoout_register_locked(extent, &set);
+   VkResult result = videoout_register_locked(target, &set);
    if (result == VK_SUCCESS && out->current && out->current != (struct wsi_videoout_swapchain *)
                                                  wsi_swapchain_from_handle(pCreateInfo->oldSwapchain))
       result = VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
@@ -1189,6 +1478,7 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
 
    struct wsi_videoout_image_params image_params = {
       .base.image_type = WSI_IMAGE_TYPE_VIDEOOUT,
+      .scaled = scaled,
    };
    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo, &image_params.base, pAllocator);
    if (result != VK_SUCCESS) {
@@ -1206,6 +1496,14 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
    chain->base.image_count = num_images;
    chain->set = set;
    chain->first = set * VIDEOOUT_BUFFERS;
+   chain->scaled = scaled;
+   chain->target = target;
+   chain->rect = scaled ? wsi_videoout_fit_rect(extent, target) : (VkRect2D){.extent = extent};
+   if (scaled)
+      fprintf(stderr,
+              "wsi/videoout: a %ux%u swapchain presents scaled to %ux%u at (%d, %d) of %ux%u framebuffers (set %u)\n",
+              extent.width, extent.height, chain->rect.extent.width, chain->rect.extent.height, chain->rect.offset.x,
+              chain->rect.offset.y, target.width, target.height, set);
 
    for (uint32_t i = 0; i < num_images; i++) {
       result = wsi_create_image(&chain->base, &chain->base.image_info, &chain->images[i]);

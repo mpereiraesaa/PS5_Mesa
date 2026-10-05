@@ -193,6 +193,8 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(BindImageMemory);
    WSI_GET_CB(BeginCommandBuffer);
    WSI_GET_CB(CmdPipelineBarrier);
+   WSI_GET_CB(CmdBlitImage);
+   WSI_GET_CB(CmdClearColorImage);
    WSI_GET_CB(CmdCopyImage);
    WSI_GET_CB(CmdCopyImageToBuffer);
    WSI_GET_CB(CmdResetQueryPool);
@@ -425,8 +427,13 @@ get_blit_type(const struct wsi_device *wsi,
    }
 #endif
 #ifdef MESA_WSI_VIDEOOUT
-   case WSI_IMAGE_TYPE_VIDEOOUT:
-      return WSI_SWAPCHAIN_NO_BLIT;
+   case WSI_IMAGE_TYPE_VIDEOOUT: {
+      /* A swapchain of a size VideoOut does not take is scaled into one of a
+       * size it does (wsi_common_videoout.c). */
+      const struct wsi_videoout_image_params *videoout_params =
+         container_of(params, const struct wsi_videoout_image_params, base);
+      return videoout_params->scaled ? WSI_SWAPCHAIN_IMAGE_BLIT : WSI_SWAPCHAIN_NO_BLIT;
+   }
 #endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    case WSI_IMAGE_TYPE_METAL: {
