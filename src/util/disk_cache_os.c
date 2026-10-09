@@ -1030,9 +1030,15 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
 bool
 disk_cache_enabled()
 {
-   /* If running as a users other than the real user disable cache */
+   /* If running as a users other than the real user disable cache.
+    * Not on the PlayStation 5: a homebrew title runs with the credentials
+    * its loader gave it and there is no setuid program to protect, while
+    * the check silently left RADV without a cache in a title that had
+    * been given elevated credentials. */
+#if !defined(__PROSPERO__)
    if (!__normal_user())
       return false;
+#endif
 
    /* At user request, disable shader cache entirely.
     * Disk cache is not enabled by default for android, for most
